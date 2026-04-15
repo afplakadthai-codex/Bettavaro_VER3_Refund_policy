@@ -24,6 +24,11 @@ if (!function_exists('bv_order_refund_boot')) {
                     break;
                 }
             }
+
+            $refundFeeEngineFile = __DIR__ . '/refund_fee_engine.php';
+            if (is_file($refundFeeEngineFile)) {
+                require_once $refundFeeEngineFile;
+            }
         }
     }
 }
@@ -362,6 +367,81 @@ if (!function_exists('bv_order_refund_require_tables')) {
         }
 
         return true;
+    }
+}
+
+
+if (!function_exists('bv_order_refund_fee_engine_available')) {
+    function bv_order_refund_fee_engine_available(): bool
+    {
+        return function_exists('bv_refund_fee_rebuild_for_refund')
+            && function_exists('bv_refund_fee_snapshot_from_order')
+            && function_exists('bv_refund_fee_snapshot_copy_to_refund');
+    }
+}
+
+if (!function_exists('bv_order_refund_get_order_by_id')) {
+    function bv_order_refund_get_order_by_id(int $orderId): ?array
+    {
+        if ($orderId <= 0) {
+            return null;
+        }
+
+        return bv_order_refund_query_one('SELECT * FROM orders WHERE id = :id LIMIT 1', ['id' => $orderId]);
+    }
+}
+
+if (!function_exists('bv_order_refund_recalculate_fee_summary')) {
+    function bv_order_refund_recalculate_fee_summary(int $refundId, ?float $requestedAmount = null): array
+    {
+        $refund = bv_order_refund_get_by_id($refundId);
+        if (!$refund) {
+            throw new RuntimeException('Refund not found for fee recalculation.');
+        }
+
+        if (!bv_order_refund_fee_engine_available()) {
+            return $refund;
+        }
+
+        $order = bv_order_refund_get_order_by_id((int)($refund['order_id'] ?? 0));
+        if (!$order) {
+            return $refund;
+        }
+
+        $requested = $requestedAmount;
+        if ($requested === null) {
+            if (isset($refund['approved_refund_amount']) && is_numeric($refund['approved_refund_amount']) && (float)$refund['approved_refund_amount'] > 0) {
+                $requested = (float)$refund['approved_refund_amount'];
+            } elseif (isset($refund['requested_refund_amount']) && is_numeric($refund['requested_refund_amount'])) {
+                $requested = (float)$refund['requested_refund_amount'];
+            } else {
+                $requested = 0.0;
+            }
+        }
+
+        $requested = bv_order_refund_validate_amount($requested);
+        bv_refund_fee_rebuild_for_refund($refundId, $order, $requested, bv_order_refund_db());
+
+        return bv_order_refund_get_by_id($refundId) ?? $refund;
+    }
+}
+
+if (!function_exists('bv_order_refund_effective_target_amount')) {
+    function bv_order_refund_effective_target_amount(array $refund): float
+    {
+        $actualTarget = isset($refund['actual_refund_amount']) && is_numeric($refund['actual_refund_amount'])
+            ? round((float)$refund['actual_refund_amount'], 2)
+            : 0.0;
+
+        $approvedAmount = isset($refund['approved_refund_amount']) && is_numeric($refund['approved_refund_amount'])
+            ? round((float)$refund['approved_refund_amount'], 2)
+            : 0.0;
+
+        if ($actualTarget > 0) {
+            return $actualTarget;
+        }
+
+        return $approvedAmount;
     }
 }
 
@@ -746,6 +826,10 @@ if (!function_exists('bv_order_refund_create_from_cancellation')) {
                 ]
             );
 
+            if (bv_order_refund_fee_engine_available()) {
+                bv_order_refund_recalculate_fee_summary($refundId, $requested);
+            }
+
             bv_order_refund_insert_ledger([
                 'order_id' => (int)$cancellation['order_id'],
                 'refund_id' => $refundId,
@@ -854,11 +938,17 @@ if (!function_exists('bv_order_refund_approve')) {
                 throw new RuntimeException('Approved refund allocation mismatch between header and items.');
             }
 
+            if (bv_order_refund_fee_engine_available()) {
+                $refund = bv_order_refund_recalculate_fee_summary($refundId, $approvedAmount);
+            } else {
+                $refund = bv_order_refund_get_by_id($refundId) ?? $refund;
+            }
+
             bv_order_refund_insert_ledger([
                 'order_id' => (int)$refund['order_id'],
                 'refund_id' => $refundId,
                 'event_type' => 'refund_approved',
-                'amount' => $approvedAmount,
+                'amount' => bv_order_refund_effective_target_amount($refund),
                 'currency' => (string)($refund['currency'] ?? 'USD'),
                 'actor_user_id' => (int)$actorUserId,
                 'actor_role' => $actorRole,
@@ -915,11 +1005,17 @@ if (!function_exists('bv_order_refund_mark_processing')) {
                 ]
             );
 
+            if (bv_order_refund_fee_engine_available()) {
+                $refund = bv_order_refund_recalculate_fee_summary($refundId);
+            } else {
+                $refund = bv_order_refund_get_by_id($refundId) ?? $refund;
+            }
+
             bv_order_refund_insert_ledger([
                 'order_id' => (int)$refund['order_id'],
                 'refund_id' => $refundId,
                 'event_type' => 'refund_processing',
-                'amount' => bv_order_refund_validate_amount($refund['approved_refund_amount'] ?? 0),
+                'amount' => bv_order_refund_effective_target_amount($refund),
                 'currency' => (string)($refund['currency'] ?? 'USD'),
                 'actor_user_id' => (int)$actorUserId,
                 'actor_role' => $actorRole,
@@ -956,15 +1052,19 @@ if (!function_exists('bv_order_refund_mark_refunded')) {
                 throw new RuntimeException('Refund not found.');
             }
 
-            $approved = bv_order_refund_validate_amount($refund['approved_refund_amount'] ?? 0);
-            if ($approved <= 0) {
-                throw new RuntimeException('Refund must be approved with positive amount before marking refunded.');
+            if (bv_order_refund_fee_engine_available()) {
+                $refund = bv_order_refund_recalculate_fee_summary($refundId);
+            }
+
+            $settlementTarget = bv_order_refund_effective_target_amount($refund);
+            if ($settlementTarget <= 0) {
+                throw new RuntimeException('Refund must have positive settlement amount before marking refunded.');
             }
 
             $currentActual = bv_order_refund_validate_amount($refund['actual_refunded_amount'] ?? 0);
             $cumulativeActual = round($currentActual + $actualAmount, 2);
-            if ($cumulativeActual > $approved) {
-                throw new RuntimeException('Cumulative refunded amount exceeds approved amount.');
+            if ($cumulativeActual > $settlementTarget) {
+                throw new RuntimeException('Cumulative refunded amount exceeds allowed refund settlement amount.');
             }
 
             if (!bv_order_refund_can_transition((string)$refund['status'], 'refunded')
@@ -972,7 +1072,7 @@ if (!function_exists('bv_order_refund_mark_refunded')) {
                 throw new RuntimeException('Invalid refund status transition for refund completion.');
             }
 
-            $toStatus = ($cumulativeActual < $approved) ? 'partially_refunded' : 'refunded';
+            $toStatus = ($cumulativeActual < $settlementTarget) ? 'partially_refunded' : 'refunded';
 
             bv_order_refund_execute(
                 'UPDATE order_refunds
@@ -1000,7 +1100,7 @@ if (!function_exists('bv_order_refund_mark_refunded')) {
             );
             $remainingTarget = $cumulativeActual;
             foreach ($items as $item) {
-                $approvedLine = bv_order_refund_validate_amount($item['approved_refund_amount'] ?? 0);
+                $approvedLine = bv_order_refund_validate_amount($item['actual_refund_after_fee'] ?? ($item['approved_refund_amount'] ?? 0));
                 $lineActual = 0.0;
                 if ($remainingTarget > 0 && $approvedLine > 0) {
                     $lineActual = $remainingTarget >= $approvedLine ? $approvedLine : $remainingTarget;
